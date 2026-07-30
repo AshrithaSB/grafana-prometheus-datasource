@@ -496,21 +496,21 @@ describe('QueryCache: Prometheus', function () {
     expect(cacheRequest.shouldCache).toBe(true);
   });
 
- it('should not cache when rangeRaw.to is an absolute timestamp', () => {
-   const request = mockPromRequest({
-     range: {
-       from: dateTime('2023-01-30T19:33:01.332Z'),
-       to: dateTime('2023-01-30T20:33:01.332Z'),
-       raw: { from: '2023-01-30T19:33:01.332Z', to: '2023-01-30T20:33:01.332Z' },
-     },
-     rangeRaw: { from: '2023-01-30T19:33:01.332Z', to: '2023-01-30T20:33:01.332Z' },
-   });
-   const storage = new QueryCache<PromQuery>({
-     getTargetSignature: getPrometheusTargetSignature,
-     overlapString: '10m',
-   });
-   const cacheRequest = storage.requestInfo(request);
-   expect(cacheRequest.shouldCache).toBe(false);
+  it('should not cache when rangeRaw.to is an absolute timestamp', () => {
+    const request = mockPromRequest({
+      range: {
+        from: dateTime('2023-01-30T19:33:01.332Z'),
+        to: dateTime('2023-01-30T20:33:01.332Z'),
+        raw: { from: '2023-01-30T19:33:01.332Z', to: '2023-01-30T20:33:01.332Z' },
+      },
+      rangeRaw: { from: '2023-01-30T19:33:01.332Z', to: '2023-01-30T20:33:01.332Z' },
+    });
+    const storage = new QueryCache<PromQuery>({
+      getTargetSignature: getPrometheusTargetSignature,
+      overlapString: '10m',
+    });
+    const cacheRequest = storage.requestInfo(request);
+    expect(cacheRequest.shouldCache).toBe(false);
   });
 
   it('should not modify the initial request', () => {
