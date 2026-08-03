@@ -33,6 +33,17 @@ describe('PromQueryBuilderContainer', () => {
       expect(container.querySelector(`${getOperationParamId('0', 0)}`)).toBeInTheDocument();
     });
   });
+
+  it('can add a second label to sum by without it reverting', async () => {
+    const { props } = setup({ expr: 'sum by(job) (ALERTS)' });
+    await userEvent.click(screen.getByTestId('operations.0.add-rest-param'));
+
+    // The second empty label slot must persist after the re-render cycle.
+    await waitFor(() => {
+      const lastCall = props.onChange.mock.calls[props.onChange.mock.calls.length - 1][0];
+      expect(lastCall.expr).toContain('sum by(job, )');
+    });
+  });
 });
 
 function setup(queryOverrides: Partial<PromQuery> = {}) {
