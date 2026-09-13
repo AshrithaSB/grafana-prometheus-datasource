@@ -190,7 +190,7 @@ func (s *QueryData) rangeQuery(ctx context.Context, c *client.Client, q *models.
 		}
 	}()
 
-	return s.parseResponse(ctx, q, res)
+	return s.parseResponse(ctx, q, res, models.RangeQueryType)
 }
 
 func (s *QueryData) instantQuery(ctx context.Context, c *client.Client, q *models.Query) backend.DataResponse {
@@ -214,7 +214,7 @@ func (s *QueryData) instantQuery(ctx context.Context, c *client.Client, q *model
 		}
 	}()
 
-	return s.parseResponse(ctx, q, res)
+	return s.parseResponse(ctx, q, res, models.InstantQueryType)
 }
 
 func (s *QueryData) exemplarQuery(ctx context.Context, c *client.Client, q *models.Query) backend.DataResponse {
@@ -236,7 +236,7 @@ func (s *QueryData) exemplarQuery(ctx context.Context, c *client.Client, q *mode
 			s.log.Warn("Failed to close response body", "error", err)
 		}
 	}()
-	return s.parseResponse(ctx, q, res)
+	return s.parseResponse(ctx, q, res, models.ExemplarQueryType)
 }
 
 func addDataResponse(res *backend.DataResponse, dr *backend.DataResponse) {
