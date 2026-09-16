@@ -14,6 +14,15 @@ import { addOperationInQueryBuilder } from '../testUtils';
 import { PromQueryBuilderContainer } from './PromQueryBuilderContainer';
 
 describe('PromQueryBuilderContainer', () => {
+  it.each([
+    ['Smoothed rate', 'rate(metric_test[$__rate_interval] smoothed)'],
+    ['Anchored increase', 'increase(metric_test[$__rate_interval] anchored)'],
+    ['Anchored resets', 'resets(metric_test[$__interval] anchored)'],
+  ])('displays %s when loading a modified query', (name, expr) => {
+    setup({ expr });
+    expect(screen.getByText(name)).toBeInTheDocument();
+  });
+
   it('translates query between string and model', async () => {
     const { props } = setup({ expr: 'rate(metric_test{job="testjob"}[$__rate_interval])' });
 
@@ -31,6 +40,18 @@ describe('PromQueryBuilderContainer', () => {
 
     waitFor(() => {
       expect(container.querySelector(`${getOperationParamId('0', 0)}`)).toBeInTheDocument();
+    });
+  });
+
+  it('can add a second label to sum by without it reverting', async () => {
+    setup({ expr: 'sum by(job) (ALERTS)' });
+
+    await userEvent.click(screen.getByTestId('operations.0.add-rest-param'));
+    // The remove button for each label only renders when params.length > def.params.length.
+    // With the bug, a spurious useEffect re-parse reverts params back to ['job'] (length 1),
+    // so no remove buttons appear. With the fix, both labels persist (length 2), giving 2 buttons.
+    await waitFor(() => {
+      expect(screen.getAllByTestId('operations.0.remove-rest-param')).toHaveLength(2);
     });
   });
 });

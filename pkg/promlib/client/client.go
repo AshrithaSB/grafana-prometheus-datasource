@@ -137,6 +137,9 @@ func (c *Client) QueryResource(ctx context.Context, req *backend.CallResourceReq
 	if err != nil {
 		return nil, err
 	}
+	// Request gzip explicitly so the SDK does not forward the browser's
+	// Accept-Encoding, which may include unsupported encodings such as zstd.
+	httpRequest.Header.Set("Accept-Encoding", "gzip")
 
 	return c.doer.Do(httpRequest)
 }

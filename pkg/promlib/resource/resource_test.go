@@ -17,12 +17,23 @@ import (
 	"github.com/grafana/grafana-plugin-sdk-go/backend"
 	"github.com/grafana/grafana-plugin-sdk-go/backend/log"
 	scope "github.com/grafana/grafana/apps/scope/pkg/apis/scope/v0alpha1"
-	schemas "github.com/grafana/schemads"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/grafana/grafana-prometheus-datasource/pkg/promlib/models"
 	"github.com/grafana/grafana-prometheus-datasource/pkg/promlib/resource"
 )
+
+// newResource parses settings and builds a Resource the way library.go's
+// newInstanceSettings does, instead of resource.New parsing settings itself.
+func newResource(t *testing.T, httpClient *http.Client, settings backend.DataSourceInstanceSettings, plog log.Logger) (*resource.Resource, error) {
+	t.Helper()
+	jsonData, err := models.ParsePromOptions(settings)
+	if err != nil {
+		return nil, err
+	}
+	return resource.New(httpClient, settings, jsonData.HTTPMethod, plog)
+}
 
 type mockRoundTripper struct {
 	Response        *http.Response
@@ -68,14 +79,14 @@ func setup() (*http.Client, backend.DataSourceInstanceSettings, log.Logger) {
 
 func TestNewResource(t *testing.T) {
 	mockClient, settings, logger := setup()
-	res, err := resource.New(mockClient, settings, logger)
+	res, err := newResource(t, mockClient, settings, logger)
 	require.NoError(t, err)
 	assert.NotNil(t, res)
 }
 
 func TestResource_Execute(t *testing.T) {
 	mockClient, settings, logger := setup()
-	res, err := resource.New(mockClient, settings, logger)
+	res, err := newResource(t, mockClient, settings, logger)
 	require.NoError(t, err)
 
 	req := &backend.CallResourceRequest{
@@ -104,7 +115,7 @@ func TestResource_ExecuteDecodesCompressedResponse(t *testing.T) {
 		URL:      "http://mock-server",
 		JSONData: []byte(`{}`),
 	}
-	res, err := resource.New(mockClient, settings, log.DefaultLogger)
+	res, err := newResource(t, mockClient, settings, log.DefaultLogger)
 	require.NoError(t, err)
 
 	resp, err := res.Execute(context.Background(), &backend.CallResourceRequest{
@@ -120,8 +131,8 @@ func TestResource_ExecuteDecodesCompressedResponse(t *testing.T) {
 // described the *original* payload (Content-Encoding, Content-Length,
 // Transfer-Encoding) must not survive onto the now-plaintext response, while
 // unrelated headers (Content-Type) must. It runs across every encoding Decode
-// understands plus the identity ("") case, so no single codec can regress and the
-// plaintext path can't be over-pruned.
+// understands plus the identity ("") case, so no single codec can regress and
+// the plaintext path can't be over-pruned.
 func TestResource_ExecuteStripsFramingHeadersAcrossEncodings(t *testing.T) {
 	body := []byte(`{"status":"success","data":["job","instance","__name__"]}`)
 
@@ -162,7 +173,7 @@ func TestResource_ExecuteStripsFramingHeadersAcrossEncodings(t *testing.T) {
 				URL:      "http://mock-server",
 				JSONData: []byte(`{}`),
 			}
-			res, err := resource.New(mockClient, settings, log.DefaultLogger)
+			res, err := newResource(t, mockClient, settings, log.DefaultLogger)
 			require.NoError(t, err)
 
 			resp, err := res.Execute(context.Background(), &backend.CallResourceRequest{URL: "/api/v1/labels"})
@@ -177,6 +188,83 @@ func TestResource_ExecuteStripsFramingHeadersAcrossEncodings(t *testing.T) {
 			require.Equal(t, "application/json", h.Get("Content-Type"), "unrelated headers must be preserved")
 		})
 	}
+}
+
+// An upstream that ignores content negotiation and answers with an encoding we
+// did not ask for must surface as an error rather than be forwarded as
+// compressed bytes labeled as plaintext.
+func TestResource_ExecuteReturnsErrorForUnexpectedEncoding(t *testing.T) {
+	mockClient := &http.Client{
+		Transport: &mockRoundTripper{
+			Response: &http.Response{
+				StatusCode: 200,
+				Body:       io.NopCloser(bytes.NewReader([]byte("opaque compressed bytes"))),
+				Header:     http.Header{"Content-Encoding": []string{"zstd"}},
+			},
+		},
+	}
+	settings := backend.DataSourceInstanceSettings{
+		ID:       1,
+		URL:      "http://mock-server",
+		JSONData: []byte(`{}`),
+	}
+	res, err := resource.New(mockClient, settings, "GET", log.DefaultLogger)
+	require.NoError(t, err)
+
+	_, err = res.Execute(context.Background(), &backend.CallResourceRequest{URL: "/api/v1/labels"})
+	require.ErrorContains(t, err, `unexpected encoding type "zstd"`)
+}
+
+// TestResource_ExecutePinsAcceptEncodingToGzip pins the encoding policy behind
+// the zstd regression fix: whatever Accept-Encoding the browser sent (Chrome
+// advertises "gzip, deflate, br, zstd" over HTTPS), the request that leaves the
+// plugin must ask for gzip — the two HTTP hops negotiate compression
+// independently, and client.QueryResource enforces this for every caller. The
+// upstream answers with gzip, and Execute decodes it and strips the framing
+// headers. The original request must not be mutated.
+func TestResource_ExecutePinsAcceptEncodingToGzip(t *testing.T) {
+	body := []byte(`{"status":"success","data":["job","instance","__name__"]}`)
+	payload := compress(t, "gzip", body)
+
+	mockClient := &http.Client{
+		Transport: &mockRoundTripper{
+			customRoundTrip: func(req *http.Request) (*http.Response, error) {
+				require.Equal(t, "gzip", req.Header.Get("Accept-Encoding"),
+					"upstream request must ask for gzip regardless of the browser's Accept-Encoding")
+				return &http.Response{
+					StatusCode: 200,
+					Body:       io.NopCloser(bytes.NewReader(payload)),
+					Header: http.Header{
+						"Content-Type":     []string{"application/json"},
+						"Content-Encoding": []string{"gzip"},
+						"Content-Length":   []string{strconv.Itoa(len(payload))},
+					},
+				}, nil
+			},
+		},
+	}
+	settings := backend.DataSourceInstanceSettings{
+		ID:       1,
+		URL:      "http://mock-server",
+		JSONData: []byte(`{}`),
+	}
+	res, err := resource.New(mockClient, settings, "GET", log.DefaultLogger)
+	require.NoError(t, err)
+
+	callReq := &backend.CallResourceRequest{
+		URL:     "/api/v1/labels",
+		Headers: map[string][]string{"Accept-Encoding": {"gzip, deflate, br, zstd"}},
+	}
+	resp, err := res.Execute(context.Background(), callReq)
+	require.NoError(t, err)
+	require.Equal(t, body, resp.Body, "gzip body must be decoded to plaintext")
+
+	h := http.Header(resp.Headers)
+	require.Empty(t, h.Get("Content-Encoding"))
+	require.Empty(t, h.Get("Content-Length"))
+
+	require.Equal(t, []string{"gzip, deflate, br, zstd"}, callReq.Headers["Accept-Encoding"],
+		"the caller's request must not be mutated")
 }
 
 // TestResource_ExecuteResponseSurvivesHTTPBoundary reproduces the production
@@ -224,7 +312,7 @@ func TestResource_ExecuteResponseSurvivesHTTPBoundary(t *testing.T) {
 	// where utils.Decode (not the transport) owns decompression — the whole
 	// reason the stale-header bug is reachable in the first place.
 	pluginClient := &http.Client{Transport: &http.Transport{DisableCompression: true}}
-	res, err := resource.New(pluginClient, settings, log.DefaultLogger)
+	res, err := newResource(t, pluginClient, settings, log.DefaultLogger)
 	require.NoError(t, err)
 
 	callResp, err := res.Execute(context.Background(), &backend.CallResourceRequest{URL: "/api/v1/labels"})
@@ -261,7 +349,7 @@ func TestResource_GetSuggestions(t *testing.T) {
 		JSONData: []byte(`{"httpMethod": "GET"}`),
 	}
 
-	res, err := resource.New(mockClient, settings, logger)
+	res, err := newResource(t, mockClient, settings, logger)
 	require.NoError(t, err)
 
 	suggestionReq := resource.SuggestionRequest{
@@ -300,7 +388,7 @@ func TestResource_GetSuggestionsForwardsCacheHeader(t *testing.T) {
 		URL:      "http://localhost:9090",
 		JSONData: []byte(`{"httpMethod": "GET"}`),
 	}
-	res, err := resource.New(mockClient, settings, log.DefaultLogger)
+	res, err := newResource(t, mockClient, settings, log.DefaultLogger)
 	require.NoError(t, err)
 
 	suggestionReq := resource.SuggestionRequest{
@@ -355,7 +443,7 @@ func TestResource_GetSuggestionsWithEmptyQueriesButFilters(t *testing.T) {
 		JSONData: []byte(`{"httpMethod": "GET"}`),
 	}
 
-	res, err := resource.New(mockClient, settings, log.DefaultLogger)
+	res, err := newResource(t, mockClient, settings, log.DefaultLogger)
 	require.NoError(t, err)
 
 	// Create a request with empty queries but with filters
@@ -396,48 +484,6 @@ func TestResource_GetSuggestionsWithEmptyQueriesButFilters(t *testing.T) {
 	// Check that both label matchers are present with their correct values
 	assert.Contains(t, decodedMatch, `job="testjob"`)
 	assert.Contains(t, decodedMatch, `instance="localhost:9090"`)
-}
-
-func TestSchemaProvider_ColumnsDecodesCompressedResponses(t *testing.T) {
-	mockClient := &http.Client{
-		Transport: &mockRoundTripper{
-			customRoundTrip: func(req *http.Request) (*http.Response, error) {
-				var body []byte
-				switch req.URL.Path {
-				case "/api/v1/labels":
-					body = []byte(`{"status":"success","data":["job"]}`)
-				case "/api/v1/metadata":
-					body = []byte(`{"status":"success","data":{"up":[{"type":"gauge","help":"Up help","unit":"short"}]}}`)
-				default:
-					t.Fatalf("unexpected request path: %s", req.URL.Path)
-				}
-
-				return &http.Response{
-					StatusCode: 200,
-					Body:       io.NopCloser(bytes.NewReader(gzipBody(t, body))),
-					Header:     http.Header{"Content-Encoding": []string{"gzip"}},
-				}, nil
-			},
-		},
-	}
-	settings := backend.DataSourceInstanceSettings{
-		ID:       1,
-		URL:      "http://localhost:9090",
-		JSONData: []byte(`{"httpMethod": "GET"}`),
-	}
-	res, err := resource.New(mockClient, settings, log.DefaultLogger)
-	require.NoError(t, err)
-
-	provider := resource.NewSchemaProvider(res)
-	resp, err := provider.Columns(context.Background(), &schemas.ColumnsRequest{
-		Tables: []string{"up"},
-	})
-
-	require.NoError(t, err)
-	require.Len(t, resp.Columns["up"], 3)
-	require.Equal(t, "job", resp.Columns["up"][2].Name)
-	require.Equal(t, "Up help", resp.TableMetadata["up"].Description)
-	require.Equal(t, "short", resp.TableMetadata["up"].Unit)
 }
 
 // compress encodes body with the given Content-Encoding, mirroring what an

@@ -10,10 +10,10 @@ import (
 	sdkhttpclient "github.com/grafana/grafana-plugin-sdk-go/backend/httpclient"
 	"github.com/grafana/grafana-plugin-sdk-go/backend/instancemgmt"
 	"github.com/grafana/grafana-plugin-sdk-go/backend/log"
-	schemas "github.com/grafana/schemads"
 
 	"github.com/grafana/grafana-prometheus-datasource/pkg/promlib/client"
 	"github.com/grafana/grafana-prometheus-datasource/pkg/promlib/instrumentation"
+	"github.com/grafana/grafana-prometheus-datasource/pkg/promlib/models"
 	"github.com/grafana/grafana-prometheus-datasource/pkg/promlib/querydata"
 	"github.com/grafana/grafana-prometheus-datasource/pkg/promlib/resource"
 )
@@ -24,12 +24,13 @@ type Service struct {
 }
 
 type instance struct {
-	queryData        *querydata.QueryData
-	resource         *resource.Resource
-	schemaDatasource *schemas.SchemaDatasource
+	queryData *querydata.QueryData
+	resource  *resource.Resource
 }
 
 type ExtendOptions func(ctx context.Context, settings backend.DataSourceInstanceSettings, clientOpts *sdkhttpclient.Options, log log.Logger) error
+
+const searchResponseLimitBytes int64 = 100 * 1024 * 1024
 
 func NewService(httpClientProvider *sdkhttpclient.Provider, plog log.Logger, extendOptions ExtendOptions) *Service {
 	if httpClientProvider == nil {
@@ -51,8 +52,23 @@ func (s *Service) Dispose() {
 
 func newInstanceSettings(httpClientProvider *sdkhttpclient.Provider, log log.Logger, extendOptions ExtendOptions) datasource.InstanceFactoryFunc {
 	return func(ctx context.Context, settings backend.DataSourceInstanceSettings) (instancemgmt.Instance, error) {
+		// Parsed once and shared for consumers below.
+		jsonData, err := models.ParsePromOptions(settings)
+		if err != nil {
+			return nil, fmt.Errorf("error reading settings: %v", err)
+		}
+
 		// Creates a http roundTripper.
-		opts, err := client.CreateTransportOptions(ctx, settings, log)
+		opts, err := client.CreateTransportOptions(
+			ctx,
+			settings,
+			jsonData.HTTPMethod,
+			string(jsonData.CustomQueryParameters),
+			float64(jsonData.MaxSamplesProcessedWarningThreshold),
+			float64(jsonData.MaxSamplesProcessedErrorThreshold),
+			bool(jsonData.QueryStatsEnabled),
+			log,
+		)
 		if err != nil {
 			return nil, fmt.Errorf("error creating transport options: %v", err)
 		}
@@ -72,39 +88,33 @@ func newInstanceSettings(httpClientProvider *sdkhttpclient.Provider, log log.Log
 		featureToggles := backend.GrafanaConfigFromContext(ctx).FeatureToggles()
 
 		// New version using custom client and better response parsing
-		qd, err := querydata.New(httpClient, settings, log, featureToggles)
+		qd, err := querydata.New(
+			httpClient,
+			settings,
+			jsonData.HTTPMethod,
+			jsonData.QueryTimeout,
+			jsonData.TimeInterval,
+			log,
+			featureToggles,
+		)
 		if err != nil {
 			return nil, err
 		}
 
 		// Resource call management using new custom client same as querydata
-		r, err := resource.New(httpClient, settings, log)
+		r, err := resource.New(httpClient, settings, jsonData.HTTPMethod, log)
 		if err != nil {
 			return nil, err
 		}
 
-		// Create schema provider for dsabstraction support
-		schemaProvider := resource.NewSchemaProvider(r)
-		schemaDs := schemas.NewSchemaDatasource(
-			schemaProvider, // SchemaHandler
-			schemaProvider, // TablesHandler
-			schemaProvider, // ColumnsHandler
-			nil,            // TableParameterValuesHandler
-			nil,            // ColumnValuesHandler
-			nil,            // fallback CallResourceHandler (handled below)
-		)
-
 		return instance{
-			queryData:        qd,
-			resource:         r,
-			schemaDatasource: schemaDs,
+			queryData: qd,
+			resource:  r,
 		}, nil
 	}
 }
 
 func (s *Service) QueryData(ctx context.Context, req *backend.QueryDataRequest) (*backend.QueryDataResponse, error) {
-	req, schemadsRefIDs := normalizeGrafanaSQLRequest(req)
-
 	if len(req.Queries) == 0 {
 		err := fmt.Errorf("query contains no queries")
 		instrumentation.UpdateQueryDataMetrics(err, nil)
@@ -120,16 +130,6 @@ func (s *Service) QueryData(ctx context.Context, req *backend.QueryDataRequest) 
 	qd, err := i.queryData.Execute(ctx, req)
 	instrumentation.UpdateQueryDataMetrics(err, qd)
 
-	// Flatten schemads responses from multi-frame time series to single tabular frame.
-	if qd != nil && len(schemadsRefIDs) > 0 {
-		for refID, dr := range qd.Responses {
-			if _, ok := schemadsRefIDs[refID]; ok && dr.Error == nil {
-				dr.Frames = flattenTimeSeriesToTabular(dr.Frames)
-				qd.Responses[refID] = dr
-			}
-		}
-	}
-
 	return qd, err
 }
 
@@ -139,12 +139,12 @@ func (s *Service) CallResource(ctx context.Context, req *backend.CallResourceReq
 		return err
 	}
 
-	// Route schemads requests (abstractionSchema/*) through the SchemaDatasource handler.
-	if strings.HasPrefix(req.Path, schemas.BaseResourcePath) {
-		return i.schemaDatasource.CallResource(ctx, req, sender)
-	}
-
 	switch {
+	case strings.HasPrefix(strings.TrimPrefix(req.Path, "/"), "api/v1/search/"):
+		// Search responses are NDJSON streams and must bypass the catch-all
+		// Execute path, which buffers and decodes the complete response.
+		ctx = sdkhttpclient.WithResponseLimit(ctx, searchResponseLimitBytes)
+		return i.resource.ExecuteSearch(ctx, req, sender)
 	case strings.EqualFold(req.Path, "suggestions"):
 		resp, err := i.resource.GetSuggestions(ctx, req)
 		if err != nil {
