@@ -1,5 +1,4 @@
 ---
-'@grafana/prometheus': patch
 'grafana-prometheus-datasource': patch
 ---
 
